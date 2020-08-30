@@ -1,0 +1,358 @@
+<p> When plotting data on an axis, you sometimes have data that has a very wide range and cannot be plotted using a linear scale. The most common example of this would be using a log-scaled plot, where the ticks on an axis may be something like 1, 10, 100, 1,000, etc, instead of 1, 2, 3, 4, 5...</p>
+
+<!--begin.rcode log_example, echo=TRUE, fig.height=8, fig.width=11, warning=FALSE
+library(tidyverse)
+library(gridExtra)
+
+set.seed(2020*2019)
+N = 15
+log_data = data.frame(
+  x = 1:N,
+  y = exp(1:N) + exp(3*rnorm(N)) 
+)
+
+unscaled_plot = ggplot(log_data) + 
+  geom_line(aes(x=x,y=y)) + 
+  ggtitle('Linear-scaled plot of x vs. y') + 
+  theme_bw()
+
+log_scaled_plot = ggplot(log_data) + 
+  geom_line(aes(x=x,y=y)) + 
+  scale_y_continuous(trans='log10') + 
+  ggtitle('Log-scaled plot of x vs. y') + 
+  theme_bw()
+
+grid.arrange(
+  unscaled_plot,
+  log_scaled_plot,
+  nrow=1
+)
+end.rcode-->
+
+<p> In the above example, I plotted some data that increases exponentially across x, with iid noise across the different points. For values of <i>x</i> until 9, you cannot tell what the difference between their <i>y</i> values on the linear-scaled plot. On the log scaled plot, however, you can tell what their values are (in exponential terms), and even see that the noise affects the smaller values more as a proportion of their value. </p>
+
+<h1> Log/Signed Log Scale with Linear Component </h1>
+
+<p> A log-scaled axis does  have its limitations, though. Namely, values cannot be zero or negative, since the logarithm of those values are not defined for the real numbers. One still might want to represent several different orders of magnitude on both positive and negative axes, or possibly deal with zeros when the differences between those values is not as important.</p>
+
+<p> One solution that people sometimes use is a pseudo-log transform: <code>x => sign(x) * log(1+abs(x))</code>. </p>
+
+<p> This function does have a pitfall, however, of not preserving the actual exponential values, and it is quite distorted around <code>|x|=1</code>. I propose an alternate scale, where a linear scale is used for small magnitudes of <i>x</i>, and a logarithmic scale is used for values outside that range. Using the <code>scales</code> package in R, I can make the basic transformation object:</p>
+
+<!--begin.rcode basic_trans, warning=FALSE, fig.height=8, fig.width=11
+library(scales)
+
+# transform function
+lal_trans_transform <- function(x) case_when(
+  x < -1 ~ -log10(abs(x)) - 1,
+  x > 1 ~ log10(x) + 1,
+  TRUE ~ x
+)
+
+# inverse transform
+lal_trans_inverse <- function(x) case_when(
+  x < -1 ~ -10^(abs(x+1)),
+  x > 1 ~ 10^(x-1),
+  TRUE ~ x
+)
+
+lal_trans = trans_new(
+  'lal',
+  transform = lal_trans_transform,
+  inverse = lal_trans_inverse,
+  breaks = function(x) {
+    x = x[is.finite(x)]
+    
+    rng = range(x)
+    if (rng[1] < -1){
+      min_val = -ceiling(log10(abs(rng[1])+1)) - 1
+    } else if (rng[1] < 0){
+      min_val = -1
+    } else if (rng[1] < 1){
+      min_val = 0
+    } else {
+      min_val = ceiling(log10(rng[1])-1) - 1
+    }
+    
+    if (rng[2] > 1){
+      max_val = floor(log10(abs(rng[2]) + 1)) + 1
+    } else if (rng[2] > 0){
+      max_val = 1
+    } else if (rng[2] > -1){
+      max_val = 0
+    } else {
+      max_val = -floor(log10(abs(rng[1]))-1) + 1
+    }
+
+    breaks = lal_trans_inverse(as.numeric(seq.int(min_val, max_val)))
+    return(breaks)
+  }
+)
+
+set.seed(2020*2019 - 2018)
+N=20
+
+# some noisy exponential data
+new_log_data = data.frame(
+  x=1:N,
+  y=(exp(1:N/2) + 10 * rnorm(N)) * rlnorm(N,-1.5)
+)
+
+ggplot(new_log_data) + 
+  geom_line(aes(x=x,y=y)) + 
+  geom_point(aes(x=x,y=y)) + 
+  scale_y_continuous(trans=lal_trans) + 
+  ggtitle('Log+Linear-scaled plot of x vs. y',
+          subtitle='Red region indicates linear-scaled area of plot') +
+  annotate(
+    'rect', 
+    fill='red',
+    alpha=0.3,
+    xmin=-Inf, xmax=Inf,
+    ymin=-1,
+    ymax=1
+  ) + 
+  theme_bw()
+
+end.rcode-->
+
+<p> One can tell what the linear region behaves like, as well as seeing the exponential trend in the logarithmic region. </p>
+
+<p> This code can also be extended in the following ways: <p>
+
+<ol>
+ <li> The exponent of the logarithm can be chosen (e.g., factors of 3 instead of 10) </li>
+ <li> The threshold can be changed from 1 to another value </li>
+ <li> The relative size of the linear region with respect to a unit change in the logarithmic axis can be an arbitrary positive value. In the above example, the distance from 0 to 1 was 1 "tick", and the distance from 1 to 10 was 1 "tick", and so on, but there's no reason why it necessarily has to take up that much or that little space. </li>
+</ol>
+
+<h2> Generalized Code </h2>
+
+<p> Below I have a generalized form of the above function and a more practical example: highlighting differences between the time series of wealth of several individuals (using synthetic data). The code looks a bit ugly, but that's mostly on account of making sure the different scales are continuous.</p>
+
+<!--begin.rcode general_trans, warning=FALSE, fig.height=8, fig.width=11
+
+## make_lal_trans
+# Makes a log/absolute log trans object
+# where values > threshold use log scale, 
+#       values < -threshold use -log scale
+#       and values between use linear scale
+# @param name - name to use for scale
+# @param threshold - threshold magnitude for linear values
+# @param exponent - exponent to use for log scale
+# @param threshold_scale - if provided, will give the linear region on either side of 0 this much weight 
+#                          vs. a unit change in the exponent
+# @param return_func_list - return transform and inverse transform functions, in addition to trans object and input parameters
+# @param force_thresholds_in_breaks - force the threshold values to be included in the breaks
+make_lal_trans <- function(
+  name, 
+  threshold=1, 
+  exponent=10, 
+  threshold_scale = NA, 
+  return_func_list=FALSE,
+  max_breaks=15,
+  force_thresholds_in_breaks=FALSE
+){
+  logf <- function(x) log(x)/log(exponent)
+  expf <- function(x) exponent ^ x
+  
+  if (is.na(threshold_scale)){
+    threshold_offset = 0
+    threshold_multiplier = 1
+  } else {
+    threshold_offset = threshold_scale-threshold
+    threshold_multiplier = threshold_scale/threshold
+  }
+  
+  cust_lal_transform <- function(x){
+    case_when(
+      x < -threshold ~ -logf(abs(x)) + logf(threshold) - threshold - threshold_offset,
+      x > threshold ~ logf(x) - logf(threshold) + threshold + threshold_offset,
+      TRUE ~ x * threshold_multiplier
+    )
+    
+  }
+  
+  cust_lal_inverse <- function(x){
+    case_when(
+      x < -threshold * threshold_multiplier ~ -expf(abs(x) - threshold + logf(threshold) - threshold_offset),
+      x > threshold * threshold_multiplier ~ expf(x - threshold + logf(threshold) - threshold_offset),
+      TRUE ~ x/threshold_multiplier
+    )
+  }
+  
+  nt = trans_new(
+    name,
+    transform = cust_lal_transform,
+    inverse = cust_lal_inverse,
+    breaks = function(x) {
+      x = x[is.finite(x)]
+      
+      rng = range(x)
+      if (rng[1] < -threshold){
+        min_val = -ceiling(logf(abs(rng[1])+1)) - 1
+      } else if (rng[1] < 0){
+        min_val = -threshold
+      } else if (rng[1] < threshold){
+        min_val = 0
+      } else {
+        min_val = ceiling(logf(rng[1])-1) - 1
+      }
+      
+      if (rng[2] > threshold){
+        max_val = floor(logf(abs(rng[2]) + 1)) + 1
+      } else if (rng[2] > 0){
+        max_val = 1
+      } else if (rng[2] > -threshold){
+        max_val = 0
+      } else {
+        max_val = -floor(logf(abs(rng[1]))-1) + 1
+      }
+
+      if (min_val < 0){
+        lower_breaks = seq.int(min_val - threshold - threshold_offset, min(0, max_val))
+      } else {
+        lower_breaks = numeric(0)
+      }
+      if (max_val > 0){
+        upper_breaks = seq.int(max_val + threshold + threshold_offset, max(0, min_val)) %>% as.numeric()
+      } else {
+        upper_breaks = numeric(0)
+      }
+      
+      breaks = c(lower_breaks, upper_breaks)
+      
+      if (between(0, min_val, max_val) | any(abs(c(min_val, max_val)) < threshold)){
+        breaks = c(breaks, 0)
+      }
+      
+      breaks = sort(unique(breaks))
+      
+      breaks = cust_lal_inverse(breaks)
+      if (length(breaks) > max_breaks){
+        n_breaks = length(breaks)
+        prop_breaks = max_breaks/n_breaks
+        factor = ceiling(1/prop_breaks)
+        idx = 1:n_breaks
+        if (0 %in% breaks)
+         z_idx = which(breaks==0)
+        else
+          z_idx = 0
+        breaks = breaks[idx %% factor == z_idx %% factor]
+      }
+      if (force_thresholds_in_breaks){
+        breaks = sort(c(breaks, -threshold, threshold))
+      }
+
+      return(breaks)
+    }
+  )
+  if (return_func_list){
+    return(list(
+      trans=nt,
+      transform=cust_lal_transform,
+      inverse=cust_lal_inverse,
+      name=name,
+      threshold=threshold,
+      exponent=exponent,
+      threshold_scale=threshold_scale
+    ))
+  }
+  return(nt)
+}
+
+# special labelling function as an alternate from the default
+exp_labeller <- function(exponent, digits=0){
+  function(x)
+  case_when(
+    x == 0 ~ '0',
+    x < 0 ~ sprintf('-%s^%s', exponent, round(log(abs(x)), digits=digits)),
+    x > 0 ~ sprintf('%s^%s', exponent, round(log(x), digits=digits))
+  )
+}
+
+# Using exponent of 3 and starting threshold at 100
+my_new_trans = make_lal_trans(
+  'trexp',
+  threshold=20,
+  exponent=3,
+  threshold_scale=0.5,
+  force_thresholds_in_breaks = TRUE
+)
+
+## create synthetic data
+set.seed(2020 * 2019)
+n_subjects = 4
+n_time = 12
+
+df_base = expand.grid(
+  subject_id = 1:n_subjects,
+  time = 1:n_time
+)
+
+time_comp = data.frame(
+  time = 1:n_time,
+  time_value = 1+cumsum(rnorm(n_time)/30)
+)
+
+subject_comp = data.frame(
+  subject_id = 1:n_subjects,
+  subject_value = 10^seq(2,6, length.out=n_subjects)
+)
+
+money_df = df_base %>%
+  inner_join(
+    time_comp
+  ) %>%
+  inner_join(
+    subject_comp
+  ) %>%
+  mutate(
+    money = (time_value + rnorm(n())/100) * subject_value + rnorm(n()),
+    subject_id = as.character(subject_id)
+  ) %>%
+  group_by(
+    subject_id
+  ) %>%
+  mutate(
+    money_diff = c(NA_real_, diff(money))
+  ) %>%
+  ungroup()
+
+unscaled_plot = ggplot(money_df) + 
+  geom_line(aes(x=time, y=money_diff, color=subject_id)) +
+  ggtitle('Linear-scaled plot of wealth changes of individuals') +
+  scale_y_continuous(label=dollar_format(accuracy=1)) + 
+  theme_bw()
+
+scaled_plot = ggplot(money_df) + 
+  geom_line(aes(x=time, y=money_diff, color=subject_id)) +
+  ggtitle('Log+Linear with exponent of 3/threshold of 20 scale of wealth changes of individuals',
+          subtitle='Red region indicates linear-scaled region') +
+  annotate(
+    'rect', 
+    fill='red',
+    alpha=0.3,
+    xmin=-Inf, xmax=Inf,
+    ymin=-20,
+    ymax=20
+  ) +
+  scale_y_continuous(label=dollar_format(accuracy=1), trans=my_new_trans) + 
+  theme_bw()
+
+grid.arrange(
+  unscaled_plot,
+  scaled_plot,
+  nrow=1
+)
+
+
+end.rcode-->
+
+<p> It is much easier to see the differences in the plot on the right than the plot on the left, without needing to draw too much attention to the linear (<span style="color:red">red</span>) region. Of course the scale is a bit arbitrary here, but it can be tweaked to any particular application, and breaks can be manually defined with the <code>breaks</code> parameter of <code>scale_[attribute]_[scale_type]</code> functions.</p>
+
+<h1> Source Code </h1>
+
+<p> You can find the code used here hosted on my GitHub.</p>
+
+<p><a href="https://github.com/mcandocia/pseudo_log_trans" id="github_log_trans_out" target="_blank">https://github.com/mcandocia/pseudo_log_trans</a></p>
